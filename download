@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.streamlit/secrets.toml
+.DS_Store
+Thumbs.db
+
+# Datos operativos y documentos de trabajadores: no subirlos a GitHub.
+/documentos/
+/datos_privados/
+*.xlsx
+*.xls
+*.pdf
+*.csv
+!topes_imponibles_plantilla.csv
+memoria_*.json
+*.log
