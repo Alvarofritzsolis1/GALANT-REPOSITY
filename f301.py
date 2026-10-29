@@ -8,12 +8,25 @@ from io import BytesIO
 import hashlib
 import re
 import unicodedata
-import pandas as pd
-import fitz
 from collections import Counter
 
+import pandas as pd
+import fitz
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
+
+try:
+    from PIL import Image, ImageFilter, ImageOps
+except Exception:  # pragma: no cover
+    Image = None
+    ImageFilter = None
+    ImageOps = None
+
 MESES={'enero':1,'febrero':2,'marzo':3,'abril':4,'mayo':5,'junio':6,'julio':7,
-       'agosto':8,'septiembre':9,'setiembre':9,'octubre':10,'noviembre':11,'diciembre':12}
+        'agosto':8,'septiembre':9,'setiembre':9,'octubre':10,'noviembre':11,'diciembre':12}
 RUT_RE=re.compile(r'(?<!\d)(\d{1,2}[.\s]?\d{3}[.\s]?\d{3}[\-\s]?[0-9kK])(?!\d)')
 FOLIO_RE=re.compile(r'\b(2000)\s*[/|\\]\s*(20\d{2})\s*[/|\\]\s*(\d{7,9})\b')
 FOLIO_ALT=re.compile(r'\b2000\s*[/|\\]\s*(20\d{2})\s*[/|\\]\s*(\d{7,9})\b')
@@ -41,16 +54,102 @@ def folio_en_pagina(texto):
     return f'{f.group(1)}/{f.group(2)}/{f.group(3)}' if f else ''
 
 
+def _preprocesar_imagen_ocr(img, escala=2.0):
+    """Mejora la lectura OCR en escaneados, fotos y PDFs con columnas.
+
+    - Aumenta resolución.
+    - Corrige contraste y elimina ruido.
+    - Detección de texto oscuro sobre fondo claro y viceversa.
+    - Binarización adaptativa cuando OpenCV está disponible.
+    """
+    if Image is None:
+        return img
+    if not isinstance(img, Image.Image):
+        img = Image.fromarray(np.asarray(img))
+    img = img.convert('L')
+    img = ImageOps.autocontrast(img)
+    img = img.resize((max(1, int(img.width * escala)), max(1, int(img.height * escala))))
+    img = img.filter(ImageFilter.SHARPEN)
+    try:
+        import cv2
+        arr = np.asarray(img)
+        if arr.ndim == 2:
+            gray = arr
+        else:
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        # Binarización adaptativa para capturar columnas y letras pequeñas.
+        bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv2.THRESH_BINARY, 31, 12)
+        bw = cv2.bitwise_not(bw)
+        img = Image.fromarray(bw)
+        img = ImageOps.autocontrast(img)
+        return img
+    except Exception:
+        # Fallback conservador para entornos sin OpenCV.
+        threshold = 180
+        img = img.point(lambda p: 255 if p > threshold else 0)
+        return img
+
+
+def _ocr_imagen_robusta(imagen, lang='spa+eng'):
+    """OCR multinivel para imágenes escaneadas, con varios PSM y enfoque en legibilidad."""
+    try:
+        import pytesseract
+    except Exception:
+        return ''
+    configs = [
+        '--psm 6 -c preserve_interword_spaces=1',
+        '--psm 11 -c preserve_interword_spaces=1',
+        '--psm 3 -c preserve_interword_spaces=1',
+    ]
+    textos = []
+    for cfg in configs:
+        texto = pytesseract.image_to_string(imagen, lang=lang, config=cfg, timeout=12)
+        if texto and texto.strip():
+            textos.append(texto)
+    if not textos:
+        return ''
+    # Selecciona el resultado más completo, no el más corto.
+    return max(textos, key=lambda t: len(re.sub(r'\s+', '', t)))
+
+
+def _rotar_ocr_optimo(imagen):
+    """Prueba rotaciones y elige la mejor lectura OCR, útil para fotos y páginas mal orientadas."""
+    if Image is None:
+        return imagen, ''
+    mejor = ('', -1, 0)
+    for angulo in (0, 90, 180, 270):
+        rot = imagen.rotate(angulo, expand=True)
+        txt = _ocr_imagen_robusta(rot)
+        if not txt:
+            continue
+        score = len(re.sub(r'\s+', '', txt))
+        if score > mejor[1]:
+            mejor = (txt, score, angulo)
+    return imagen.rotate(mejor[2], expand=True) if mejor[2] else imagen, mejor[0]
+
+
 def leer_pagina(page, permitir_ocr=True):
     t=page.get_text('text',sort=True)
-    if len(t.strip())>180:return t,'DIGITAL'
-    if not permitir_ocr:return t,'SIN_TEXTO'
-    import pytesseract
-    from PIL import Image
-    pix=page.get_pixmap(matrix=fitz.Matrix(1.7,1.7),alpha=False)
-    im=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
-    s=pytesseract.image_to_string(im,lang='eng',config='--psm 3',timeout=8)
-    return s,'OCR'
+    if len(t.strip())>180:
+        return t,'DIGITAL'
+    if not permitir_ocr:
+        return t,'SIN_TEXTO'
+    try:
+        import pytesseract
+        from PIL import Image
+        pix=page.get_pixmap(matrix=fitz.Matrix(2.2,2.2),alpha=False)
+        img=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
+        img = _preprocesar_imagen_ocr(img, escala=2.0)
+        img, txt = _rotar_ocr_optimo(img)
+        if not txt:
+            txt = _ocr_imagen_robusta(img)
+        if txt and len(txt.strip()) > 10:
+            return txt,'OCR'
+        # Ultimo fallback: la lectura directa sin preprocesado, si la imagen es muy pequeña.
+        return pytesseract.image_to_string(img,lang='spa+eng',config='--psm 6',timeout=8),'OCR'
+    except Exception:
+        return t,'SIN_TEXTO'
 
 
 def pagina_es_resumen(texto):
@@ -246,11 +345,15 @@ def extraer_nomina(t,periodo='',folio='',archivo='',pagina=1):
 
 def _ocr_zona(page, coordenadas, psm=6):
     """Segunda lectura local: solo el recorte dudoso, en alta resolución."""
-    import pytesseract
-    from PIL import Image
-    pix=page.get_pixmap(matrix=fitz.Matrix(3,3),clip=fitz.Rect(*coordenadas),alpha=False)
-    im=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
-    return pytesseract.image_to_string(im,config=f'--psm {psm}',lang='eng',timeout=8)
+    try:
+        import pytesseract
+        from PIL import Image
+        pix=page.get_pixmap(matrix=fitz.Matrix(3,3),clip=fitz.Rect(*coordenadas),alpha=False)
+        img=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
+        img=_preprocesar_imagen_ocr(img, escala=2.0)
+        return _ocr_imagen_robusta(img)
+    except Exception:
+        return ''
 
 
 def _extraer_cabecera_ocr_simple(t):
@@ -355,7 +458,8 @@ def _extract_nomina_columnas(page,periodo,folio,archivo,numero_pagina,esperados=
             if r.is_empty:return ''
             pi=page.get_pixmap(matrix=fitz.Matrix(4,4),clip=r,alpha=False)
             img=Image.frombytes('RGB',(pi.width,pi.height),pi.samples)
-            return pytesseract.image_to_string(img,lang='eng',config='--psm 6',timeout=12)
+            img=_preprocesar_imagen_ocr(img, escala=2.0)
+            return _ocr_imagen_robusta(img)
         cr=texto_columna(x_left+width*.095,x_left+width*.267)
         cn=texto_columna(x_left+width*.318,x_left+width*.80)
         ruts=[]
