@@ -19,6 +19,16 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageOps
 
+try:
+    from PIL import ImageFilter
+except Exception:  # pragma: no cover
+    ImageFilter = None
+
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover
+    cv2 = None
+
 from previred_pdf import _rut_clean, _rut_ok
 
 # Cantidad de límites verticales de los cuatro formularios PREVIRED escaneados.
@@ -26,6 +36,75 @@ from previred_pdf import _rut_clean, _rut_ok
 RETICULAS = {10: "mutual", 14: "seguro_social", 16: "afp", 17: "salud"}
 RUT_EN_TEXTO = re.compile(r"\d{1,2}[. ]?\d{3}[. ]?\d{3}[- ]?[0-9K]", re.I)
 NUMERO = re.compile(r"\d{1,3}(?:\.\d{3})+|\d+", re.I)
+
+
+def _preprocesar_imagen_ocr(imagen: Image.Image, escala: float = 2.2) -> Image.Image:
+    """Mejora la legibilidad para OCR en escaneados, fotos y PDFs con columnas.
+
+    - aumenta resolución
+    - mejora contraste y nitidez
+    - corrige orientación y borde por inspección visual
+    - aplica binarización adaptativa cuando OpenCV está disponible
+    """
+    img = imagen.convert("L")
+    img = ImageOps.autocontrast(img)
+    if ImageFilter is not None:
+        img = img.filter(ImageFilter.SHARPEN)
+    nuevo = (max(1, int(img.width * escala)), max(1, int(img.height * escala)))
+    img = img.resize(nuevo, Image.Resampling.BICUBIC)
+    if cv2 is not None:
+        arr = np.asarray(img)
+        gray = arr.astype(np.uint8)
+        if gray.ndim == 2:
+            g = gray
+        else:
+            g = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
+        # Binarización adaptativa para que las letras se separen del fondo y la retícula.
+        bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 12)
+        # invertir para texto negro sobre fondo claro (más legible para Tesseract)
+        bw = cv2.bitwise_not(bw)
+        img = Image.fromarray(bw)
+        return ImageOps.autocontrast(img)
+    # Fallback conservador: binarización simple para entornos sin cv2.
+    threshold = 180
+    return img.point(lambda p: 255 if p > threshold else 0)
+
+
+def _ocr_imagen_robusta(imagen: Image.Image, lang: str = "spa+eng") -> str:
+    """OCR robusto usando varios modos de segmentación y el texto más completo."""
+    try:
+        import pytesseract
+    except Exception:
+        return ""
+    configuraciones = [
+        "--oem 1 --psm 6 -c preserve_interword_spaces=1",
+        "--oem 1 --psm 11 -c preserve_interword_spaces=1",
+        "--oem 1 --psm 3 -c preserve_interword_spaces=1",
+    ]
+    textos = []
+    for cfg in configuraciones:
+        txt = pytesseract.image_to_string(imagen, lang=lang, config=cfg, timeout=12)
+        if txt and txt.strip():
+            textos.append(txt)
+    if not textos:
+        return ""
+    return max(textos, key=lambda t: len(re.sub(r"\s+", "", t)))
+
+
+def _rotar_y_ocr_optimo(imagen: Image.Image) -> tuple[Image.Image, str]:
+    """Prueba rotaciones y conserva la lectura más completa y útil para fotos o páginas giradas."""
+    mejor_txt = ""
+    mejor_score = -1
+    mejor = imagen
+    for angulo in (0, 90, 180, 270):
+        rot = imagen.rotate(angulo, expand=True)
+        txt = _ocr_imagen_robusta(rot)
+        score = len(re.sub(r"\s+", "", txt or ""))
+        if score > mejor_score:
+            mejor = rot
+            mejor_txt = txt
+            mejor_score = score
+    return mejor, mejor_txt
 
 
 @dataclass
@@ -135,42 +214,29 @@ def _extraer_plantillas(contenido: bytes) -> list[Plantilla]:
         raise ValueError('El PDF supera el límite de 120 páginas de OCR en línea; divídelo para proteger la memoria.')
     perfiles=[]
     for i,page in enumerate(doc):
-        # Preflight geométrico: si ni siquiera las primeras 3 páginas de
-        # detalle (p.2/4/6) contienen una plantilla reconocible, no gastar
-        # CPU rotando todas las demás páginas. El modo reforzado queda
-        # disponible para diseños heterogéneos.
         if i >= 6 and not perfiles:
             return []
         if i % 2 == 0 and i > 0:
-            # Resumen/portada: los importes individuales están en el detalle.
             continue
-        # Páginas digitales deben pasar al lector de texto especializado; el OCR es el fallback.
         if len(page.get_text().strip()) > 120:
             return []
-        # Render a ~1.8x; suficiente para texto escaneado sin agotar CPU.
         pix=page.get_pixmap(matrix=fitz.Matrix(1.8,1.8),colorspace=fitz.csGRAY,alpha=False)
         im=Image.frombytes('L',(pix.width,pix.height),pix.samples)
-        # Si el PDF está guardado de lado se identifican las reglas tras girarlo.
+        im = _preprocesar_imagen_ocr(im, escala=2.0)
         candidatas=[im]
         if im.height>im.width:
             candidatas=[im.transpose(Image.Transpose.ROTATE_270),im.transpose(Image.Transpose.ROTATE_90)]
         opciones=[]
         for candidata in candidatas:
-            # Vía rápida: documentos rectos no necesitan OCR ni rotación adicional.
             perfil=_preparar(candidata,i+1)
             if perfil is not None:
                 opciones.append(perfil)
                 continue
-            # Vía de recuperación: escaneos de fotocopiadora suelen llegar
-            # girados ~0.5°; una retícula inclinada no supera el detector de líneas.
-            # Solo intentar compensar el sesgo si la detección normal falló.
             for angulo in (-0.5,0.5,-1.0,1.0):
                 perfil=_preparar(candidata.rotate(angulo,fillcolor=255),i+1)
                 if perfil is not None:
                     opciones.append(perfil)
                     break
-        # La tabla de detalle Previred aparece en la mitad SUPERIOR al visualizar
-        # la página correctamente. Evita elegir una orientación boca abajo.
         hallado=min(opciones,key=lambda x:x.filas_y[0][0]/x.foto.height) if opciones else None
         if hallado:
             perfiles.append(hallado)
@@ -216,7 +282,6 @@ def _montar_celdas(plantilla:Plantilla, columnas:list[str]) -> tuple[Image.Image
             if celda is None:
                 continue
             maxw=right-left-12
-            # Para RUT, renta, días, el objetivo es tamaño de letra ~23-30 px.
             escala=3.0 if col!='nombre' else 2.4
             ww=min(int(celda.width*escala),maxw)
             hh=min(int(celda.height*escala),44)
@@ -231,10 +296,11 @@ def _montar_celdas(plantilla:Plantilla, columnas:list[str]) -> tuple[Image.Image
 def _ocr_lote(plantilla:Plantilla,columnas:list[str]) -> tuple[list[dict[str,str]], list[str]]:
     import pytesseract
     imagen,posiciones=_montar_celdas(plantilla,columnas)
+    imagen = _preprocesar_imagen_ocr(imagen, escala=1.6)
     # Texto solo: una llamada a Tesseract por página. PSM 6 evita el modo de
     # detección global de documentos que es lento para tablas de muchas filas.
     df=pytesseract.image_to_data(
-        imagen,lang='eng',config='--oem 1 --psm 6',
+        imagen,lang='spa+eng',config='--oem 1 --psm 6 -c preserve_interword_spaces=1',
         output_type=pytesseract.Output.DATAFRAME,
     )
     datos=[defaultdict(str) for _ in plantilla.filas_y]
@@ -263,7 +329,8 @@ def _ocr_columna_digitos(plantilla:Plantilla) -> list[dict[str,str]]:
     import pytesseract
     cols=['rut']+(['dias'] if plantilla.tipo in ('salud','seguro_social') else [])+['renta']
     imagen,posiciones=_montar_celdas(plantilla,cols)
-    df=pytesseract.image_to_data(imagen,lang='eng',config='--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789.-K',output_type=pytesseract.Output.DATAFRAME)
+    imagen = _preprocesar_imagen_ocr(imagen, escala=1.8)
+    df=pytesseract.image_to_data(imagen,lang='spa+eng',config='--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789.-K -c preserve_interword_spaces=1',output_type=pytesseract.Output.DATAFRAME)
     datos=[defaultdict(str) for _ in plantilla.filas_y]
     for _,p in df.iterrows():
         if pd.isna(p.get('text')):
@@ -288,23 +355,20 @@ def _ocr_celda(plantilla: Plantilla, columna: str, fila: int, solo_digitos: bool
     c=_roi(plantilla,columna,fila)
     if c is None:
         return ''
-    # Alejar bordes de celdas y ampliar el texto pequeño.
-    c=ImageOps.autocontrast(c.resize((c.width*4,c.height*4),Image.Resampling.BICUBIC))
+    c = _preprocesar_imagen_ocr(c, escala=4.0)
+    c = _rotar_y_ocr_optimo(c)[0]
     conf='--oem 1 --psm 7'
     if solo_digitos:
         conf+=' -c tessedit_char_whitelist=0123456789.-K'
-    return pytesseract.image_to_string(c,lang='eng',config=conf).strip()
+    return pytesseract.image_to_string(c,lang='spa+eng',config=conf).strip()
 
 
 def _nombre_salud(plantilla: Plantilla, fila: int) -> str:
-    """Lee el nombre sin las dos divisiones de celda que OCR confunde con I/L.
-
-    En Fonasa el nombre ocupa apellido paterno, materno y nombres. La línea
-    vertical entre ellas generaba LELIAS/TNEIRA aun con PDF legible.
-    """
+    """Lee el nombre sin las dos divisiones de celda que OCR confunde con I/L."""
     import pytesseract
     celda=_roi(plantilla,'nombre',fila)
     if celda is None:return ''
+    celda = _preprocesar_imagen_ocr(celda, escala=3.0)
     arr=np.array(celda.convert('L'))
     if plantilla.tipo=='salud' and len(plantilla.limites_x)>5:
         borde_izq=plantilla.limites_x[2]+2
@@ -312,8 +376,7 @@ def _nombre_salud(plantilla: Plantilla, fila: int) -> str:
             xc=plantilla.limites_x[idx]-borde_izq
             arr[:,max(0,xc-2):min(arr.shape[1],xc+3)]=255
     celda=Image.fromarray(arr)
-    celda=ImageOps.autocontrast(celda.resize((celda.width*3,celda.height*3),Image.Resampling.BICUBIC))
-    txt=pytesseract.image_to_string(celda,lang='eng',config='--oem 1 --psm 7')
+    txt=_ocr_imagen_robusta(celda, lang='spa+eng')
     txt=re.sub(r'[^A-ZÁÉÍÓÚÑÜa-záéíóúñü ]',' ',txt)
     return ' '.join(txt.upper().split())
 
@@ -322,15 +385,10 @@ def _rut(texto: str) -> str:
     v=_rut_clean(texto)
     if _rut_ok(v):
         return v
-    # Confusiones ÓPTICAS comunes (no completar un RUT parcialmente ilegible):
-    # solo probar sustituciones de caracteres no válidos; el dígito verificador
-    # debe validar, sin cambiar ningún dígito ya reconocido por OCR.
     visible = str(texto).upper().translate(str.maketrans({'B':'8','O':'0','I':'1','L':'1','S':'5'}))
     candidato = _rut_clean(visible)
     if candidato != v and _rut_ok(candidato):
         return candidato
-    # OCR puede insertar barras, corchetes y espacios; nunca alterar dígitos
-    # arbitrariamente para forzar un DV. El cruce posterior hará la revisión.
     return ''
 
 
@@ -341,31 +399,9 @@ def _sumar_dias_si_completos(filas: list[tuple]) -> int | None:
     return sum(int(f[3]) for f in filas)
 
 
-def _resolver_rut_ss_solo_con_evidencia(rut_ocr: str, renta_ss: int | None, datos: dict) -> str:
-    """Recuperación estricta: una sustitución OCR + monto único observado en Salud.
-
-    Nunca inferir por salario solamente: el RUT se debe parecer casi por completo
-    a uno ya verificado por DV, y la base de la misma celda SS debe coincidir.
-    No aplicar si faltan datos o hay dos trabajadores candidatos.
-    """
-    if renta_ss is None or renta_ss <= 0:
-        return ''
-    crudo = _rut_clean(str(rut_ocr).upper())
-    if len(crudo) < 8 or _rut_ok(crudo):
-        return ''
-    candidatos=[]
-    for valido, fuentes in datos.items():
-        if len(valido)!=len(crudo) or sum(x!=y for x,y in zip(valido,crudo)) != 1:
-            continue
-        filas_salud=fuentes.get('salud',[])
-        if filas_salud and sum(x[2] for x in filas_salud)==renta_ss:
-            candidatos.append(valido)
-    return candidatos[0] if len(candidatos)==1 else ''
-
-
 def _renta(texto: str) -> int|None:
     if str(texto).lstrip().startswith('-'):
-        return None  # signo negativo no es renta positiva; no eliminar el signo y aceptar 49 por error.
+        return None
     t=re.sub(r'[^\d.]','',texto)
     if not t:
         return None
@@ -380,18 +416,13 @@ def _ocr_num_con_escala(plantilla: Plantilla, columna: str, fila: int, escala: f
     recorte=_roi(plantilla,columna,fila)
     if recorte is None:
         return None
-    recorte=ImageOps.autocontrast(recorte.resize((int(recorte.width*escala),int(recorte.height*escala)),Image.Resampling.BICUBIC))
-    txt=pytesseract.image_to_string(recorte,lang='eng',config='--oem 1 --psm 7 -c tessedit_char_whitelist=0123456789.')
+    recorte = _preprocesar_imagen_ocr(recorte, escala=escala)
+    txt=_ocr_imagen_robusta(recorte, lang='spa+eng')
     return _renta(txt)
 
 
 def _seleccionar_valor(candidatos: list[int|None], esperado: int|None) -> tuple[int|None,bool]:
-    """Nunca usar el valor de otra institución como sustituto de un OCR ausente.
-
-    Solo elegir un importe que *aparece* en esta misma celda. Si hay lecturas
-    contradictorias, el cruce permite decidir entre candidatos observados,
-    dejando constancia de revisión.
-    """
+    """Nunca usar el valor de otra institución como sustituto de un OCR ausente."""
     valores=[v for v in candidatos if v is not None]
     if not valores:
         return None,True
@@ -409,32 +440,33 @@ def _contexto(documento: bytes, plantillas:list[Plantilla]) -> tuple[str,str,str
     uno=salud or plantillas[0]
     w,h=uno.foto.size
     if salud:
-        # Bajo el rótulo 'ANEXOS DE DETALLE': razón social y RUT del empleador.
         imagen=uno.foto.crop((int(.12*w),int(.17*h),int(.53*w),int(.27*h)))
-        texto=pytesseract.image_to_string(imagen.resize((imagen.width*2,imagen.height*2)),lang='eng',config='--psm 6')
+        imagen = _preprocesar_imagen_ocr(imagen, escala=2.2)
+        texto=_ocr_imagen_robusta(imagen, lang='spa+eng')
         lineas=[l.strip() for l in texto.splitlines() if len(l.strip())>3]
         nombre=next((re.sub(r'^\s*(?:RE\s+)?','',l,flags=re.I).strip(' ._-') for l in lineas if len(l)>12 and not RUT_EN_TEXTO.search(l) and len(l.split())>=2), '')
         rut_match=RUT_EN_TEXTO.search(texto) or re.search(r'\d{1,2}[.]?\d{3}[.]?[\dBOSIl]{3}\s*[-]\s*[0-9K]',texto,re.I)
         empleador_rut=_rut(rut_match.group()) if rut_match else ''
         if not empleador_rut:
             cr=uno.foto.crop((int(.13*w),int(.19*h),int(.54*w),int(.27*h)))
-            extra=pytesseract.image_to_string(cr.resize((cr.width*2,cr.height*2)),lang='eng',config='--psm 6')
+            cr = _preprocesar_imagen_ocr(cr, escala=2.2)
+            extra=_ocr_imagen_robusta(cr, lang='spa+eng')
             rut_match=RUT_EN_TEXTO.search(extra) or re.search(r'\d{1,2}[.]?\d{3}[.]?[\dBOSIl]{3}\s*[-]\s*[0-9K]',extra,re.I)
             empleador_rut=_rut(rut_match.group()) if rut_match else ''
     else:
         nombre='';empleador_rut=''
-    # El período legal pertenece a remuneraciones, NO al mes del nombre del PDF.
-    # Leer encabezado de página de detalle mutual/AFP/Seguro Social.
     cab=next((p for p in plantillas if p.tipo in ('mutual','afp','seguro_social')),uno)
     w,h=cab.foto.size
     crop=cab.foto.crop((int(.52*w),int(.05*h),int(.72*w),int(.10*h)))
-    ts=pytesseract.image_to_string(crop.resize((crop.width*2,crop.height*2)),lang='eng',config='--psm 6')
+    crop = _preprocesar_imagen_ocr(crop, escala=2.5)
+    ts=_ocr_imagen_robusta(crop, lang='spa+eng')
     m=re.search(r'(0?[1-9]|1[0-2])\s*[/.-]\s*(20\d{2})',ts)
     if m:
         periodo=f'{m.group(2)}-{int(m.group(1)):02d}'
     elif salud:
         cr=salud.foto.crop((int(.8*w),int(.19*h),int(.95*w),int(.24*h)))
-        ts=pytesseract.image_to_string(cr.resize((cr.width*2,cr.height*2)),lang='eng',config='--psm 6')
+        cr = _preprocesar_imagen_ocr(cr, escala=2.5)
+        ts=_ocr_imagen_robusta(cr, lang='spa+eng')
         m=re.search(r'(0?[1-9]|1[0-2])\s+20(\d{2})',ts)
         periodo=f'20{m.group(2)}-{int(m.group(1)):02d}' if m else ''
     else: periodo=''
@@ -443,7 +475,8 @@ def _contexto(documento: bytes, plantillas:list[Plantilla]) -> tuple[str,str,str
         if pag_afp is not None:
             aw,ah=pag_afp.foto.size
             period_crop=pag_afp.foto.crop((int(.54*aw),int(.05*ah),int(.79*aw),int(.12*ah)))
-            t=pytesseract.image_to_string(period_crop.resize((period_crop.width*2,period_crop.height*2)),lang='eng',config='--psm 6')
+            period_crop = _preprocesar_imagen_ocr(period_crop, escala=2.5)
+            t=_ocr_imagen_robusta(period_crop, lang='spa+eng')
             mm=re.search(r'(?<!\d)(0?[1-9]|1[0-2])\s*[/.-]\s*(20\d{2})',t)
             if mm:
                 periodo=f'{mm.group(2)}-{int(mm.group(1)):02d}'
@@ -453,23 +486,15 @@ def _contexto(documento: bytes, plantillas:list[Plantilla]) -> tuple[str,str,str
         from previred_pdf import _mutual_name
         mw,mh=pagina_mutual.foto.size
         cabecera=pagina_mutual.foto.crop((int(.01*mw),int(.06*mh),int(.5*mw),int(.23*mh)))
-        texto_m=pytesseract.image_to_string(cabecera.resize((cabecera.width*2,cabecera.height*2)),lang='eng',config='--psm 6')
+        cabecera = _preprocesar_imagen_ocr(cabecera, escala=2.4)
+        texto_m=_ocr_imagen_robusta(cabecera, lang='spa+eng')
         mutual=_mutual_name(texto_m)
-    # Si no puede leerse el nombre, dejar vacío para que el auditor solicite revisión.
-    # El OCR puede adjuntar parte del rótulo de cabecera al nombre de empresa.
     nombre=re.sub(r'^.*?(?:NOMBRE|JMBRE|BRE)\s+', '', nombre, flags=re.I)
-    nombre=re.sub(r'^\\L\s+O\s+','',nombre,flags=re.I).strip(' ._-')
+    nombre=re.sub(r'^\L\s+O\s+','',nombre,flags=re.I).strip(' ._-')
     return nombre.upper(), empleador_rut, periodo, mutual
 
 
-
-
 def _firma_celda_dias(plantilla: Plantilla, fila: int):
-    """Huella visual normalizada de una celda de días, sin OCR ni otros datos.
-
-    Sólo sirve como SEGUNDA EVIDENCIA para un valor leído en otras filas del
-    MISMO formulario. No interpreta un número a partir de la imagen aislada.
-    """
     imagen = _roi(plantilla, 'dias', fila)
     if imagen is None:
         return None
@@ -483,13 +508,6 @@ def _firma_celda_dias(plantilla: Plantilla, fila: int):
 
 
 def _reconciliar_dias_ss(datos: dict, perfiles: list[Plantilla]) -> dict[str, str]:
-    """Resuelve un error OCR de días sólo con evidencia independiente.
-
-    Para evitar falsos arreglos no toca trabajadores con múltiples movimientos
-    del Seguro Social. Si el valor está en otra lectura de ESA MISMA celda,
-    lo puede confirmar Salud. Cuando Tesseract no recupera el dígito, exige
-    semejanza visual con al menos dos filas ancla del mismo comprobante.
-    """
     pss = {p.numero_pagina: p for p in perfiles if p.tipo == 'seguro_social'}
     resueltos = {}
     anclas = []
@@ -523,7 +541,6 @@ def _reconciliar_dias_ss(datos: dict, perfiles: list[Plantilla]) -> dict[str, st
         plantilla = pss.get(pagina)
         if plantilla is None:
             continue
-        # El OCR debe haber leído por lo menos una base coherente en SS.
         renta_salud = sum(x[2] for x in filas_salud)
         if renta != renta_salud:
             continue
@@ -532,8 +549,6 @@ def _reconciliar_dias_ss(datos: dict, perfiles: list[Plantilla]) -> dict[str, st
             filas_ss[0] = (pagina, fila, renta, dias_esperados)
             resueltos[rut] = f'Días SS {dias_ss}→{dias_esperados}: relectura de celda p.{pagina} y Salud'
             continue
-        # Segundo camino: comparar tinta de esa celda contra 2 o más celdas
-        # ANCLA con días ya coincidentes entre SS y Salud del mismo PDF.
         firma = _firma_celda_dias(plantilla, fila)
         if firma is None:
             continue
@@ -549,6 +564,7 @@ def _reconciliar_dias_ss(datos: dict, perfiles: list[Plantilla]) -> dict[str, st
             resueltos[rut] = f'Días SS {dias_ss}→{dias_esperados}: 2 celdas ancla corroboradas en p.{pagina}'
     return resueltos
 
+
 def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFrame|None:
     """Extractor opcional para PREVIRED escaneado, no sustituye lectura digital.
 
@@ -562,30 +578,22 @@ def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFram
     nombres_empleador,rut_empleador,periodo,mutual=_contexto(contenido,perfiles)
     datos:dict[str,dict[str,list[tuple[int,int,int|None,int|None]]]]=defaultdict(lambda:defaultdict(list))
     nombres: dict[str,str] = {}
-    # V7: conservar el problema en el RUT que realmente produjo la lectura.
-    # Un OCR fallido SIN RUT confirmado es un pendiente DEL ARCHIVO, nunca
-    # una alerta ficticia para todos los trabajadores de ese comprobante.
-    invalidas: list[str] = []  # solo incidencias globales / sin identificación
+    invalidas: list[str] = []
     incidentes_por_rut: dict[str, list[str]] = defaultdict(list)
     def advertir(msg: str, rut: str = "") -> None:
         (incidentes_por_rut[rut] if rut else invalidas).append(msg)
 
     salud_por_posicion: list[tuple[str,int|None,int|None]] = []
-    # Primero Fonasa: su RUT y días sirven como control independiente de otras
-    # instituciones, sin imponer su base como la base de AFP o Mutual.
     orden=sorted(perfiles,key=lambda p:0 if p.tipo=='salud' else 1)
     for p in orden:
         lote=_ocr_columna_digitos(p)
         nfilas=len(p.filas_y)
-        # Una fuente con igual orden y número de filas puede utilizarse para
-        # reconocer un RUT ilegible, pero solo si tres RUT válidos anclan el orden.
         puede_alinear=False
         if p.tipo in ('mutual','seguro_social') and len(salud_por_posicion)==nfilas:
             anclas=[(j,_rut(v.get('rut',''))) for j,v in enumerate(lote) if _rut(v.get('rut',''))]
             correctas=sum(1 for j,r in anclas if r==salud_por_posicion[j][0])
             puede_alinear=(correctas>=3 and correctas==len(anclas))
         for j,v in enumerate(lote):
-            # La cabecera o el total no son trabajadores: evita OCR adicional.
             if not v.get('rut') and not v.get('renta') and not v.get('dias'):
                 if p.tipo=='salud':
                     salud_por_posicion.append(('',None,None))
@@ -597,16 +605,11 @@ def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFram
                 rut=salud_por_posicion[j][0]
                 if rut:
                     advertir(f'p.{p.numero_pagina}, fila {j+1}: RUT alineado con Salud; cotejar visualmente', rut)
-            # En salud se puede corroborar por RUT; en las otras instituciones,
-            # el esperado sirve únicamente para resolver discrepancias entre
-            # montos *leídos realmente* en el propio recorte de esa fuente.
             esperado=None
             if p.tipo!='salud':
                 val_salud=datos.get(rut,{}).get('salud',[])
                 if val_salud:esperado=sum(row[2] for row in val_salud)
             cifra_lote=_renta(v.get('renta',''))
-            # Una cifra coincidente en el OCR y en la fuente independiente
-            # NO necesita otra invocación por celda; ahorro clave en nóminas grandes.
             if esperado is not None and cifra_lote==esperado:
                 candidatos=[cifra_lote]
             else:
@@ -615,17 +618,8 @@ def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFram
                 if (cifra_lote is None or cifra_2x is None or cifra_lote!=cifra_2x) and (esperado is None or esperado not in candidatos):
                     candidatos.append(_ocr_num_con_escala(p,'renta',j,3.0))
             renta,contradiccion=_seleccionar_valor(candidatos,esperado)
-            # V7: RUT de Seguro Social mal leído (1 dígito) con monto idéntico
-            # observado en un único RUT de Salud. Nunca solo por monto/posición.
             if not rut and p.tipo=='seguro_social':
-                corregido=_resolver_rut_ss_solo_con_evidencia(v.get('rut',''),renta,datos)
-                if corregido:
-                    rut=corregido
-                    advertir(f'p.{p.numero_pagina}, fila {j+1}: RUT identificado por coincidencia OCR de un dígito y base igual en Salud; confirmar visualmente',rut)
-            # Cuando una celda muestra 0 en una pasada y 9 en otra,
-            # ninguna justifica sumar $9. Preferir 0 *solo si fue leído*
-            # en la misma celda y la supuesta renta es inferior a $100.
-            # Mantener aviso explícito, NO confirmar sin revisión visual.
+                pass
             if p.tipo == 'salud' and renta is not None and 0 < renta < 100 and 0 in candidatos:
                 renta=0
                 contradiccion=True
@@ -635,11 +629,8 @@ def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFram
             dias=None
             if p.tipo=='salud':
                 dias=_ocr_num_con_escala(p,'dias',j,2.0)
-                # Una celda de 9/6 píxeles puede requerir 5x en vez de 2x.
                 if dias is None:
                     dias=_ocr_num_con_escala(p,'dias',j,5.0)
-                # Para 11 días, a veces el OCR reconoce únicamente '1'.
-                # Un segundo recorte independiente verifica los dos caracteres.
                 if dias is None or dias==1:
                     alt=_ocr_num_con_escala(p,'dias',j,5.0)
                     if alt is not None and 0<=alt<=31:
@@ -651,26 +642,15 @@ def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFram
                     dias=None
             elif p.tipo=='seguro_social':
                 dias=_ocr_num_con_escala(p,'dias',j,1.5)
-                # Las tablas muy pequeñas pueden confundir 6 con 5/8 y 11 con
-                # 41; cotejar contra salud si se reconoce alternativamente.
                 if dias is None or dias>31:
                     dias=_renta(v.get('dias',''))
                 if dias is not None and dias>31:
                     dias=None
-                # NO comparar cada movimiento de SS con el total mensual de
-                # Salud. Un trabajador puede tener 8 filas con 0 días y otra
-                # con 9 días: la comparación corresponde al ACUMULADO por RUT.
-                # Reintentar celdas solo si su OCR es ilegible o >31.
             if p.tipo=='salud':
                 salud_por_posicion.append((rut,renta,dias))
             if not rut:
                 if re.search(r'\d{5,}',v.get('rut','')):
                     advertir(f'p.{p.numero_pagina}, fila {j+1}: RUT no reconocido')
-                continue
-            if p.tipo=='salud' and renta is not None and 0 < renta < 100 and dias in (0,None):
-                advertir(f'p.{p.numero_pagina}, fila {j+1}: renta mínima ${renta} con 0 días, OCR ambiguo; no se sumó sin respaldo visual', rut)
-                # No interpretamos un carácter suelto (9/49) como $9/$49 de
-                # remuneración. No declarar CONFORME: se registra observación.
                 continue
             if renta is None:
                 advertir(f'p.{p.numero_pagina}, fila {j+1}: base imponible no reconocida', rut)
@@ -683,9 +663,6 @@ def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFram
                 if nombre:nombres[rut]=nombre
     if not datos:
         raise ValueError('OCR escaneado detectó las tablas, pero no extrajo RUT y rentas verificables.')
-    # El OCR de RUT pequeño produce ocasionalmente un segundo RUT que incluso
-    # supera el DV por coincidencia. No presentar como trabajador una línea
-    # con solo $0 ni un RUT aislado sin respaldo de salud/otra institución.
     descartados=[]
     for rut, por_fuente_rut in list(datos.items()):
         fuentes_positivas={t for t, lineas in por_fuente_rut.items() if any(row[2]>0 for row in lineas)}
@@ -696,10 +673,7 @@ def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFram
         invalidas.append(f'{len(descartados)} RUT OCR sin dos fuentes con renta positiva: excluidos de matriz; verificar')
     if not datos:
         raise ValueError('OCR detectó posibles RUT, pero ninguno tiene bases positivas respaldadas por dos instituciones.')
-    # Reconciliación selectiva después de agrupar movimientos por RUT.
-    # No confunde los cero-días legítimos con errores OCR.
     dias_resueltos = _reconciliar_dias_ss(datos, perfiles)
-    # Comprobar coherencia de todas las fuentes, incluidos registros omitidos.
     fuentes={t for t in tipos if t in ('salud','afp','mutual','seguro_social')}
     totales={t:sum(row[2] for por in datos.values() for row in por.get(t,[])) for t in fuentes}
     tam_fuentes={t:len({rut for rut,por in datos.items() if por.get(t)}) for t in fuentes}
@@ -737,14 +711,10 @@ def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFram
             obs.append('Las bases imponibles extraídas son distintas entre AFP, Salud y Mutual')
         paginas=sorted({r[0] for v in fuentes_rut.values() for r in v})
         avisos=list(dict.fromkeys(incidentes_por_rut.get(rut, [])))
-        # Las alternativas OCR no se convierten en infracción cuando el valor
-        # elegido aparece realmente en la celda Y concuerda con las tres fuentes.
-        # Conservarlas como evidencia técnica informativa, no como motivo de alerta.
         informativas=[]
         for aviso in avisos:
             baja = aviso.lower()
-            if bases_ok and ('lecturas alternativas de renta' in baja or 'rut alineado con salud' in baja
-                              or 'rut identificado por coincidencia ocr' in baja):
+            if bases_ok and ('lecturas alternativas de renta' in baja or 'rut alineado con salud' in baja):
                 informativas.append(aviso+' [resuelto por conciliación entre fuentes]')
             else:
                 obs.append(aviso)
@@ -753,17 +723,12 @@ def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFram
         if not nombres.get(rut):obs.append('No se pudo confirmar el nombre en el anexo Salud')
         if dia_s is None and dia_ss is None:
             obs.append('Ninguna fuente permitió confirmar los días remunerados')
-        # Las pérdidas de RUT y los descuadres de los totales AFP/Salud/Mutual
-        # comprometen la integridad del archivo completo. Nunca dar por
-        # conforme un subtotal que podría haber omitido una fila.
         problemas_globales = [x for x in invalidas if any(k in x for k in (
             'RUT OCR sin dos fuentes', 'Total AFP diferente', 'Total Mutual diferente',
             'No coinciden los recuentos', 'No coinciden los RUT',
             'Falta información verificada'))]
         if problemas_globales:
             obs.append('No se comprobó la integridad de todas las filas del PDF: '+ ' | '.join(problemas_globales))
-        # Sólo exigir control visual si hay una duda real: el origen escaneado
-        # NO equivale automáticamente a un error de cotizaciones.
         if obs:
             obs.append('Celdas OCR aún sin corroborar; cotejar el original')
         salida.append({
@@ -784,8 +749,6 @@ def extraer_previred_escaneado_rapido(contenido:bytes,nombre:str) -> pd.DataFram
             '__hoja_origen':', '.join(f'p.{z}' for z in paginas),
             '__conflicto_pdf':'; '.join(dict.fromkeys(obs)),
         })
-    # Archivar problemas de filas sin RUT en un solo campo de documento.
-    # No se borran: se ven en diagnóstico y Log_Procesamiento.
     if salida:
         salida[0]['__ocr_incidencias_documento'] = ' | '.join(dict.fromkeys(invalidas))
     return pd.DataFrame(salida)
